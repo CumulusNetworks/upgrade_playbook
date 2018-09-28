@@ -1,0 +1,149 @@
+./generic_upgrade_playbook.yml 
+- hosts: all
+  gather_facts: true
+  become: yes
+  vars:
+    # Location where the image is being stored for download
+    desired_image: https://192.168.0.254/images/cumulus-linux-3.7.0-bcm-amd64.bin
+    # Location where the ZTP script is being stored
+    ztp_url: https://192.168.0.254/ztp/cumulus-ztp
+    # Max number of packets to be sent on a link between
+    #  counter interval 1 and 2 for it to be considered
+    #  out of service.
+    counter_threshold: 500
+    l3_uplinks: ['swp51', 'swp52']
+  tasks:
+    - name: Assert Minimum Software Version (CL v3.5.0+)
+      assert:
+        that: "{{ansible_lsb.release is version_compare('3.5', '>=') }}"
+        msg: "Cumulus Linux version must be 3.5 or later to support BGP Graceful Shutdown. Version {{ansible_lsb.release}} detected"
+
+    - name: Write Syslog on Cumulus device to inform Ansible Start
+      shell: /usr/bin/logger -t "ANSIBLE" "Update Routine starting."
+
+    # Do this early so that we won't attempt to take the node out of service if
+    #  the image is not available. Also clear-out any existing pre-staged images
+    - name: Prestage the Image for Upgrade
+      shell: /usr/cumulus/bin/onie-install -cf && /usr/cumulus/bin/onie-install -fa -i {{desired_image}} -z {{ztp_url}}
+
+    - name: Set Node into Maintenance Mode
+      shell: /usr/bin/vtysh -c "config t" -c "router bgp" -c "bgp graceful-shutdown" -c "end" -c "wr"
+
+    # Assumes that the Loopback of the node is being advirtised via BGP.
+    #  If that is not the case the next 4 tasks can be commented-out.
+    - name: Collect Loopback IP Address and Prefix
+      shell: /usr/bin/net show interface lo json
+      register: loopback_info_json
+      changed_when: false
+
+    - name: Convert collected Loopback Info to Ansible Variable
+      set_fact:
+        loopback_info: "{{loopback_info_json.stdout | from_json}}"
+      changed_when: false
+
+    - name: Scrape the Loopback IP out of the Loopback Info
+      set_fact:
+        loopback_ip: "{{loopback_info['iface_obj']['ip_address']['allentries'][1]}}"
+      changed_when: false
+
+    - name: DEBUG loopback_ip
+      debug: var=loopback_ip
+
+    - name: Collect Loopback Route Information
+      shell: /usr/bin/vtysh -c "show ip bgp {{ loopback_ip }}" | grep "Community"
+      register: loopback_route
+      changed_when: false
+
+    #- name: DEBUG loopback_route
+    #  debug: var=loopback_route.stdout
+
+    - name: Confirm that Graceful-Shutdown Community is Applied to Loopback Route
+      assert:
+        that:
+          - "'graceful-shutdown' in loopback_route.stdout"
+        msg: "The Graceful-Shutdown community must be present in the loopback route advertisement."
+
+    - name: Wait 5 seconds for Maintenance Mode to Propogate
+      pause:
+        seconds: 5
+
+    - name: Clear Counters
+      shell: /usr/cumulus/bin/cl-netstat -c
+
+    - name: Collect List of Interfaces to Validate (physical interfaces starting with 'swp' or 'fp')
+      shell: /usr/bin/net show interface | tail -n +3 | grep -v "ADMDN" | awk '{print $2}' | egrep -e '^swp|^fp'
+      register: interfaces_to_validate
+      changed_when: false
+
+    - name: Collect Initial Interface Counters
+      shell: /usr/cumulus/bin/cl-netstat -j
+      register: initial_counters_json
+      changed_when: false
+
+    - name: Wait 5 seconds for Interface Counters to Increment
+      pause:
+        seconds: 5
+
+    - name: Collect Interface Counters Again (for comparison)
+      shell: /usr/cumulus/bin/cl-netstat -j
+      register: second_counters_json
+      changed_when: false
+
+    - name: Convert Counters Information to Ansible Variables
+      set_fact:
+        initial_counters: "{{initial_counters_json.stdout | from_json}}"
+        second_counters: "{{second_counters_json.stdout | from_json}}"
+      changed_when: false
+
+    #- name: DEBUG initial_counters
+    #  debug: var=initial_counters
+
+    #- name: DEBUG second_counters
+    #  debug: var=second_counters
+
+    - name: DEBUG Interface Traffic Rate Comparison
+      debug: msg="INTERFACE {{item}} -----      {{second_counters[item]['RX_OK']|int - initial_counters[item]['RX_OK']|int}} <= {{counter_threshold}}"
+      with_items:
+        - "{{interfaces_to_validate.stdout_lines}}"
+
+    - name: Validate Expected Interface Traffic Rates
+      assert:
+        that: "(second_counters['{{item}}']['RX_OK']|int - initial_counters['{{item}}']['RX_OK']|int) <= counter_threshold|int"
+        msg: "There must be less than {{counter_threshold}} packets received on the interface in a 5 second interval for the interface to be considered out of service."
+      with_items:
+        - "{{interfaces_to_validate.stdout_lines}}"
+
+    - name: Check if CLAG is running
+      shell: systemctl status clagd.service
+      register: clag_status
+      changed_when: false
+
+    # This block only triggers on devices running CLAG (leaf switches)
+    - block: 
+      - name: CLAG -- Make the node "secondary"
+        shell: /usr/bin/clagctl priority 9000
+
+      - name: CLAG -- Wait 10sec for clagd to inform peer
+        wait_for:
+          timeout: 10
+        delegate_to: 'localhost'
+
+      - name: CLAG -- Bring down L3 Uplinks
+        shell: /sbin/ifdown {{item}}
+        with_items: "{{l3_uplinks}}"
+
+      - name: CLAG -- Bring down Peerlink (proto-downs host ports)
+        shell: /sbin/ifdown peerlink
+      when: clag_status.rc == 0
+
+    - name: Stop Routing Daemons
+      service: name=frr state=stopped
+
+    - name: Write Syslog on Cumulus device to inform Ansible Finish
+      shell: /usr/bin/logger -t "ANSIBLE" "Upgrade routine complete. Upgrade to commence now."
+
+    - name: Starting Upgrade and Rebooting the Machine
+      shell: sleep 2 && shutdown -r now "Upgrade Started via Ansible"
+      async: 1
+      poll: 0
+      ignore_errors: true
