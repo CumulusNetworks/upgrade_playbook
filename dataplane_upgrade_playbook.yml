@@ -10,7 +10,7 @@
     # Max number of packets to be sent on a link between
     #  counter interval 1 and 2 for it to be considered
     #  out of service.
-    counter_threshold: 500
+    counter_threshold: 1000
     l3_uplinks: ['swp51', 'swp52']
   tasks:
     - name: Assert Minimum Software Version (CL v3.5.0+)
@@ -80,9 +80,9 @@
       register: initial_counters_json
       changed_when: false
 
-    - name: Wait 5 seconds for Interface Counters to Increment
+    - name: Wait 30 seconds for Interface Counters to Increment
       pause:
-        seconds: 5
+        seconds: 30
 
     - name: Collect Interface Counters Again (for comparison)
       shell: /usr/cumulus/bin/cl-netstat -j
@@ -129,11 +129,11 @@
         delegate_to: 'localhost'
 
       - name: CLAG -- Bring down L3 Uplinks
-        shell: /sbin/ifdown {{item}}
+        shell: /sbin/ip link set {{item}} down
         with_items: "{{l3_uplinks}}"
 
       - name: CLAG -- Bring down Peerlink (proto-downs host ports)
-        shell: /sbin/ifdown peerlink
+        shell: /sbin/ip link set peerlink down
       when: clag_status.rc == 0
 
     - name: Stop Routing Daemons
