@@ -1,4 +1,3 @@
-./generic_upgrade_playbook.yml 
 - hosts: all
   gather_facts: true
   become: yes
